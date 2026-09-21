@@ -44,6 +44,10 @@ public class UsimsEsimFix extends XposedModule {
     private static final AtomicBoolean ENV_LOGGED = new AtomicBoolean(false);
     private static final AtomicLong LOGIN_SEQ = new AtomicLong(0);
     private static volatile Context APP_CONTEXT;
+    private static final java.util.Set<String> HOOKED_INTEGRITY_METHODS =
+            java.util.Collections.newSetFromMap(
+                    new java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+            );
 
     private static final String[] REQUEST_FIELDS = new String[]{
             "phone",
@@ -68,16 +72,400 @@ public class UsimsEsimFix extends XposedModule {
 
         final ClassLoader classLoader = param.getDefaultClassLoader();
 
+        hookCompatibilityPreferenceReads();
+        hookPlayIntegrityFactory(classLoader);
         hookUsimsEsimCheck(classLoader);
         hookUsimsRouteLogin(classLoader);
         hookOkHttpRouteLogin(classLoader);
 
-        log(Log.INFO, TAG, "v1.4.1 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG, "v1.4.2 loaded for " + TARGET_PACKAGE);
         log(Log.INFO, TAG,
-                "MODULE diagnostics=routeLogin+PlayIntegrityReadOnly process=" + safeProcessName()
+                "MODULE diagnostics=routeLogin+prefs+PlayIntegrityReadOnly process=" + safeProcessName()
                         + " pid=" + android.os.Process.myPid()
                         + " uid=" + android.os.Process.myUid()
                         + " classLoader=" + classLoader.getClass().getName());
+    }
+
+    private void hookCompatibilityPreferenceReads() {
+        try {
+            Class<?> prefs = Class.forName("android.app.SharedPreferencesImpl");
+            int installed = 0;
+
+            for (Method method : prefs.getDeclaredMethods()) {
+                String name = method.getName();
+                Class<?>[] p = method.getParameterTypes();
+
+                if (p.length == 0 || p[0] != String.class) {
+                    continue;
+                }
+
+                if (!("getString".equals(name)
+                        || "getBoolean".equals(name)
+                        || "getInt".equals(name)
+                        || "getLong".equals(name)
+                        || "getFloat".equals(name)
+                        || "contains".equals(name))) {
+                    continue;
+                }
+
+                method.setAccessible(true);
+                final Method hooked = method;
+
+                hook(hooked)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            String key = null;
+                            try {
+                                if (!chain.getArgs().isEmpty()) {
+                                    Object arg0 = chain.getArgs().get(0);
+                                    if (arg0 != null) {
+                                        key = String.valueOf(arg0);
+                                    }
+                                }
+                            } catch (Throwable ignored) {
+                            }
+
+                            Object result = chain.proceed();
+
+                            if (isCompatibilityPreferenceKey(key)) {
+                                log(Log.INFO, TAG,
+                                        "PREF_READ key=" + key
+                                                + " method=" + hooked.getName()
+                                                + " value="
+                                                + summarizeCompatibilityPrefValue(result));
+                                logInterestingStack("PREF_READ caller", 8);
+                            }
+
+                            return result;
+                        });
+                installed++;
+            }
+
+            log(Log.INFO, TAG,
+                    "Hook installed: SharedPreferences compatibility reads count="
+                            + installed);
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "SharedPreferences compatibility hook unavailable", t);
+        }
+    }
+
+    private boolean isCompatibilityPreferenceKey(String key) {
+        return "backendEsimCompatibilityValue".equals(key)
+                || "userphoneesimcompatible".equals(key);
+    }
+
+    private String summarizeCompatibilityPrefValue(Object value) {
+        if (value == null) {
+            return "null";
+        }
+
+        if (value instanceof Boolean || value instanceof Number) {
+            return String.valueOf(value);
+        }
+
+        String text = String.valueOf(value);
+        String lower = text.trim().toLowerCase(Locale.ROOT);
+
+        if ("true".equals(lower)
+                || "false".equals(lower)
+                || "0".equals(lower)
+                || "1".equals(lower)
+                || "yes".equals(lower)
+                || "no".equals(lower)
+                || "null".equals(lower)
+                || text.isEmpty()) {
+            return truncate(text, 80);
+        }
+
+        return "<type=" + value.getClass().getName()
+                + " len=" + text.length()
+                + " sha256=" + shortHash(text) + ">";
+    }
+
+    private void logCompatibilityPreferencesSnapshot(Context context, String prefix) {
+        if (context == null) {
+            return;
+        }
+
+        java.io.FileInputStream input = null;
+        try {
+            java.io.File dir = new java.io.File(
+                    context.getApplicationInfo().dataDir,
+                    "shared_prefs"
+            );
+
+            java.io.File[] files = dir.listFiles();
+            if (files == null || files.length == 0) {
+                log(Log.INFO, TAG, prefix + " shared_prefs=<empty>");
+                return;
+            }
+
+            boolean found = false;
+
+            for (java.io.File file : files) {
+                if (file == null
+                        || !file.isFile()
+                        || !file.getName().endsWith(".xml")) {
+                    continue;
+                }
+
+                input = new java.io.FileInputStream(file);
+                org.xmlpull.v1.XmlPullParser parser = android.util.Xml.newPullParser();
+                parser.setInput(input, "UTF-8");
+
+                int event;
+                while ((event = parser.next())
+                        != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) {
+                    if (event != org.xmlpull.v1.XmlPullParser.START_TAG) {
+                        continue;
+                    }
+
+                    String key = parser.getAttributeValue(null, "name");
+                    if (!isCompatibilityPreferenceKey(key)) {
+                        continue;
+                    }
+
+                    found = true;
+                    String tag = parser.getName();
+                    String value;
+
+                    if ("string".equals(tag)) {
+                        try {
+                            value = parser.nextText();
+                        } catch (Throwable ignored) {
+                            value = "<unreadable>";
+                        }
+                    } else {
+                        value = parser.getAttributeValue(null, "value");
+                    }
+
+                    log(Log.INFO, TAG,
+                            prefix
+                                    + " file=" + file.getName()
+                                    + " key=" + key
+                                    + " tag=" + tag
+                                    + " value="
+                                    + summarizeCompatibilityPrefValue(value));
+                }
+
+                try {
+                    input.close();
+                } catch (Throwable ignored) {
+                }
+                input = null;
+            }
+
+            if (!found) {
+                log(Log.INFO, TAG,
+                        prefix
+                                + " keys=[backendEsimCompatibilityValue,"
+                                + "userphoneesimcompatible] <not-found>");
+            }
+        } catch (Throwable t) {
+            log(Log.INFO, TAG,
+                    prefix + " <unavailable:"
+                            + t.getClass().getSimpleName() + ">");
+        } finally {
+            if (input != null) {
+                try {
+                    input.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    private void hookPlayIntegrityFactory(ClassLoader classLoader) {
+        try {
+            Class<?> factory = Class.forName(
+                    "com.google.android.play.core.integrity.IntegrityManagerFactory",
+                    false,
+                    classLoader
+            );
+
+            int installed = 0;
+            for (Method method : factory.getDeclaredMethods()) {
+                if (!("create".equals(method.getName())
+                        || "createStandard".equals(method.getName()))) {
+                    continue;
+                }
+
+                method.setAccessible(true);
+                final Method hooked = method;
+
+                hook(hooked)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            long started =
+                                    android.os.SystemClock.elapsedRealtime();
+
+                            log(Log.INFO, TAG,
+                                    "INTEGRITY_FACTORY BEGIN method="
+                                            + hooked.toGenericString()
+                                            + " argTypes="
+                                            + summarizeArgTypes(chain.getArgs()));
+                            logInterestingStack("INTEGRITY_FACTORY caller", 10);
+
+                            Object manager = chain.proceed();
+
+                            long elapsed =
+                                    android.os.SystemClock.elapsedRealtime()
+                                            - started;
+
+                            log(Log.INFO, TAG,
+                                    "INTEGRITY_FACTORY END method="
+                                            + hooked.getName()
+                                            + " elapsedMs=" + elapsed
+                                            + " managerClass="
+                                            + (manager == null
+                                            ? "null"
+                                            : manager.getClass().getName()));
+
+                            if (manager != null) {
+                                hookIntegrityRuntimeManager(manager);
+                            }
+
+                            return manager;
+                        });
+                installed++;
+            }
+
+            log(Log.INFO, TAG,
+                    "Hook installed: IntegrityManagerFactory methods="
+                            + installed);
+        } catch (Throwable t) {
+            log(Log.INFO, TAG,
+                    "IntegrityManagerFactory unavailable: "
+                            + t.getClass().getSimpleName());
+        }
+    }
+
+    private void hookIntegrityRuntimeManager(Object manager) {
+        if (manager == null) {
+            return;
+        }
+
+        try {
+            Class<?> cls = manager.getClass();
+
+            for (Method method : cls.getMethods()) {
+                String name = method.getName();
+                if (!("requestIntegrityToken".equals(name)
+                        || "prepareIntegrityToken".equals(name))) {
+                    continue;
+                }
+
+                String id = cls.getName() + "#" + method.toGenericString();
+                if (!HOOKED_INTEGRITY_METHODS.add(id)) {
+                    continue;
+                }
+
+                method.setAccessible(true);
+                final Method hooked = method;
+
+                try {
+                    hook(hooked)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .intercept(chain -> {
+                                long started =
+                                        android.os.SystemClock.elapsedRealtime();
+
+                                log(Log.INFO, TAG,
+                                        "INTEGRITY_CALL BEGIN method="
+                                                + hooked.toGenericString()
+                                                + " argTypes="
+                                                + summarizeArgTypes(chain.getArgs()));
+                                logInterestingStack("INTEGRITY_CALL caller", 10);
+
+                                Object result = chain.proceed();
+
+                                long elapsed =
+                                        android.os.SystemClock.elapsedRealtime()
+                                                - started;
+
+                                log(Log.INFO, TAG,
+                                        "INTEGRITY_CALL END method="
+                                                + hooked.getName()
+                                                + " elapsedMs=" + elapsed
+                                                + " returnClass="
+                                                + (result == null
+                                                ? "null"
+                                                : result.getClass().getName()));
+
+                                return result;
+                            });
+
+                    log(Log.INFO, TAG,
+                            "Hook installed: integrity runtime method="
+                                    + hooked.toGenericString());
+                } catch (Throwable hookError) {
+                    log(Log.WARN, TAG,
+                            "Integrity runtime hook failed: "
+                                    + hooked.toGenericString(),
+                            hookError);
+                }
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "Integrity runtime manager diagnostic failed", t);
+        }
+    }
+
+    private String summarizeArgTypes(java.util.List<?> args) {
+        if (args == null) {
+            return "null";
+        }
+
+        java.util.List<String> types = new java.util.ArrayList<>();
+        for (Object arg : args) {
+            types.add(arg == null ? "null" : arg.getClass().getName());
+        }
+        return String.valueOf(types);
+    }
+
+    private void logInterestingStack(String label, int maxFrames) {
+        try {
+            StackTraceElement[] frames =
+                    Thread.currentThread().getStackTrace();
+
+            int written = 0;
+            for (StackTraceElement frame : frames) {
+                if (frame == null) {
+                    continue;
+                }
+
+                String cls = frame.getClassName();
+                if (cls == null
+                        || cls.startsWith("java.lang.Thread")
+                        || cls.startsWith("io.github.usimsfix.")) {
+                    continue;
+                }
+
+                if (!(cls.startsWith("com.wonet.usims")
+                        || cls.startsWith("com.google.android.play.core.integrity")
+                        || cls.startsWith("com.google.android.recaptcha")
+                        || cls.startsWith("android."))) {
+                    continue;
+                }
+
+                log(Log.INFO, TAG,
+                        label + "[" + written + "]="
+                                + frame.getClassName()
+                                + "." + frame.getMethodName()
+                                + ":" + frame.getLineNumber());
+
+                written++;
+                if (written >= maxFrames) {
+                    break;
+                }
+            }
+
+            if (written == 0) {
+                log(Log.INFO, TAG, label + "=<no-interesting-frames>");
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     private void hookUsimsEsimCheck(ClassLoader classLoader) {
@@ -117,6 +505,7 @@ public class UsimsEsimFix extends XposedModule {
 
                         if (context != null && ENV_LOGGED.compareAndSet(false, true)) {
                             logEnvironment(context);
+                            logCompatibilityPreferencesSnapshot(context, "PREF INITIAL");
                         }
 
                         Object original = "<not-evaluated>";
@@ -257,6 +646,10 @@ public class UsimsEsimFix extends XposedModule {
                                 if (ctx != null) {
                                     logNetworkSnapshot(ctx, "DIRECT NET");
                                     logIdentityConsistency();
+                                    logCompatibilityPreferencesSnapshot(
+                                            ctx,
+                                            "DIRECT PREF " + endpointName
+                                    );
                                 } else {
                                     log(Log.INFO, TAG,
                                             "DIRECT context=<not-yet-captured>");
@@ -699,9 +1092,12 @@ public class UsimsEsimFix extends XposedModule {
                 || "phone_os_version".equals(key)
                 || "phone_manufacturer".equals(key)
                 || "phone_esim_compatible".equals(key)
-                || "phone_app_version".equals(key)
-                || "app_id".equals(key)) {
+                || "phone_app_version".equals(key)) {
             return truncate(value, 300);
+        }
+
+        if ("app_id".equals(key)) {
+            return sensitiveSummary(value);
         }
 
         if ("phone".equals(key)) {
