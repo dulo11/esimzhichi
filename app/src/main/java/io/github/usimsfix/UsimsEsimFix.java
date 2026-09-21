@@ -67,7 +67,7 @@ public class UsimsEsimFix extends XposedModule {
         hookUsimsRouteLogin(classLoader);
         hookOkHttpRouteLogin(classLoader);
 
-        log(Log.INFO, TAG, "v1.3.1 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG, "v1.3.2 loaded for " + TARGET_PACKAGE);
     }
 
     private void hookUsimsEsimCheck(ClassLoader classLoader) {
@@ -151,14 +151,19 @@ public class UsimsEsimFix extends XposedModule {
             hook(hooked)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept(chain -> {
+                        String url = "";
+                        boolean isRouteLogin = false;
+
                         try {
                             Object urlObj = chain.getArgs().size() > 0
                                     ? chain.getArgs().get(0) : null;
                             Object mapObj = chain.getArgs().size() > 1
                                     ? chain.getArgs().get(1) : null;
 
-                            String url = String.valueOf(urlObj);
-                            if (url.contains(ROUTE_LOGIN)) {
+                            url = String.valueOf(urlObj);
+                            isRouteLogin = url.contains(ROUTE_LOGIN);
+
+                            if (isRouteLogin) {
                                 log(Log.INFO, TAG,
                                         "========== routeLoginCall DIRECT BEGIN ==========");
                                 log(Log.INFO, TAG,
@@ -199,10 +204,31 @@ public class UsimsEsimFix extends XposedModule {
                             }
                         } catch (Throwable t) {
                             log(Log.WARN, TAG,
-                                    "Direct routeLoginCall diagnostic failed", t);
+                                    "Direct routeLoginCall request diagnostic failed", t);
                         }
 
-                        return chain.proceed();
+                        try {
+                            Object result = chain.proceed();
+
+                            if (isRouteLogin) {
+                                log(Log.INFO, TAG,
+                                        "========== routeLoginCall RESPONSE BEGIN ==========");
+                                logDirectLoginResponse(result);
+                                log(Log.INFO, TAG,
+                                        "========== routeLoginCall RESPONSE END ==========");
+                            }
+
+                            return result;
+                        } catch (Throwable t) {
+                            if (isRouteLogin) {
+                                log(Log.ERROR, TAG,
+                                        "routeLoginCall threw "
+                                                + t.getClass().getName()
+                                                + " message="
+                                                + summarizeThrowableMessage(t.getMessage()));
+                            }
+                            throw t;
+                        }
                     });
 
             log(Log.INFO, TAG,
@@ -211,6 +237,138 @@ public class UsimsEsimFix extends XposedModule {
             log(Log.ERROR, TAG,
                     "Failed to install direct USIMS network hook", t);
         }
+    }
+
+    private void logDirectLoginResponse(Object result) {
+        if (result == null) {
+            log(Log.INFO, TAG, "DIRECT response=null");
+            return;
+        }
+
+        String raw = String.valueOf(result);
+        log(Log.INFO, TAG,
+                "DIRECT responseClass=" + result.getClass().getName()
+                        + " len=" + raw.length()
+                        + " sha256=" + shortHash(raw));
+
+        String trimmed = raw.trim();
+        if (!trimmed.startsWith("{")) {
+            if (looksSensitiveResponseText(trimmed)) {
+                log(Log.INFO, TAG,
+                        "DIRECT responseText=<redacted len=" + raw.length()
+                                + " sha256=" + shortHash(raw) + ">");
+            } else {
+                log(Log.INFO, TAG,
+                        "DIRECT responseText=" + truncate(trimmed, 1000));
+            }
+            return;
+        }
+
+        try {
+            JSONObject obj = new JSONObject(trimmed);
+
+            java.util.List<String> keys = new java.util.ArrayList<>();
+            java.util.Iterator<String> iterator = obj.keys();
+            while (iterator.hasNext()) {
+                keys.add(iterator.next());
+            }
+            java.util.Collections.sort(keys);
+            log(Log.INFO, TAG, "DIRECT responseKeys=" + keys);
+
+            String[] diagnosticKeys = new String[]{
+                    "code",
+                    "status",
+                    "success",
+                    "message",
+                    "msg",
+                    "error",
+                    "error_code",
+                    "errorCode",
+                    "reason"
+            };
+
+            boolean found = false;
+            for (String key : diagnosticKeys) {
+                if (!obj.has(key) || obj.isNull(key)) {
+                    continue;
+                }
+                found = true;
+                Object value = obj.opt(key);
+                log(Log.INFO, TAG,
+                        "DIRECT response." + key + "="
+                                + summarizeResponseValue(key, value));
+            }
+
+            if (!found) {
+                log(Log.INFO, TAG,
+                        "DIRECT response=<JSON parsed; no standard diagnostic fields>");
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "DIRECT response JSON parse failed; len=" + raw.length()
+                            + " sha256=" + shortHash(raw));
+        }
+    }
+
+    private String summarizeResponseValue(String key, Object value) {
+        if (value == null || value == JSONObject.NULL) {
+            return "null";
+        }
+
+        String lower = key == null ? "" : key.toLowerCase(Locale.ROOT);
+        String text = String.valueOf(value);
+
+        if (lower.contains("token")
+                || lower.contains("authorization")
+                || lower.contains("cookie")
+                || lower.contains("session")
+                || lower.contains("secret")
+                || lower.contains("password")
+                || lower.contains("phone")
+                || lower.contains("mobile")
+                || lower.contains("email")
+                || lower.contains("device")) {
+            return "<redacted len=" + text.length()
+                    + " sha256=" + shortHash(text) + ">";
+        }
+
+        if (value instanceof JSONObject
+                || value instanceof org.json.JSONArray) {
+            return "<json len=" + text.length()
+                    + " sha256=" + shortHash(text) + ">";
+        }
+
+        return truncate(text, 1000);
+    }
+
+    private boolean looksSensitiveResponseText(String text) {
+        if (text == null) {
+            return false;
+        }
+
+        String lower = text.toLowerCase(Locale.ROOT);
+        return lower.contains("token")
+                || lower.contains("authorization")
+                || lower.contains("cookie")
+                || lower.contains("session")
+                || lower.contains("secret")
+                || lower.contains("password")
+                || lower.contains("device_id")
+                || lower.contains("mediadrm")
+                || lower.contains("phone\"")
+                || lower.contains("mobile\"")
+                || lower.contains("email\"");
+    }
+
+    private String summarizeThrowableMessage(String message) {
+        if (message == null) {
+            return "null";
+        }
+        if (looksSensitiveResponseText(message)) {
+            return "<redacted len=" + message.length()
+                    + " sha256=" + shortHash(message) + ">";
+        }
+        return truncate(message, 500);
     }
 
     private String summarizeDirectMapValue(String key, String value) {
