@@ -64,9 +64,10 @@ public class UsimsEsimFix extends XposedModule {
         final ClassLoader classLoader = param.getDefaultClassLoader();
 
         hookUsimsEsimCheck(classLoader);
+        hookUsimsRouteLogin(classLoader);
         hookOkHttpRouteLogin(classLoader);
 
-        log(Log.INFO, TAG, "v1.2.0 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG, "v1.3.1 loaded for " + TARGET_PACKAGE);
     }
 
     private void hookUsimsEsimCheck(ClassLoader classLoader) {
