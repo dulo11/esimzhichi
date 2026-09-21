@@ -1,41 +1,73 @@
 # USIMS eSIM Fix
 
-一个只针对 **USIMS (com.wonet.usims)** 的 LSPosed / libxposed API 102 模块。
+只作用于 **USIMS (com.wonet.usims)** 的 LSPosed / libxposed API 102 模块。
 
-## 功能
-USIMS v3.90 的本地 eSIM 兼容判断位于：
+## v1.2.0
 
-`com.wonet.usims.helpers.i.d(android.content.Context): boolean`
+在继续强制 USIMS 本地 eSIM 检测为 true 的基础上，加入完整诊断：
 
-本模块只在 USIMS 进程中把这个判断返回值改成 `true`，不修改其他 App，也不会把整个系统变成原生 eSIM 手机。
+- USIMS 版本、versionCode、安装来源、签名证书 SHA-256
+- Google Play 商店 / Google Play services / GSF 版本
+- Build manufacturer / brand / model / device / product
+- fingerprint / hardware / board / bootloader / type / tags / Android 版本 / 安全补丁 / ABI
+- eUICC feature、EuiccManager 是否存在、isEnabled
+- 关键硬件 feature
+- Android ID 仅记录长度和 SHA-256 前缀，不记录原值
+- Widevine Device Unique ID 仅记录长度和 SHA-256 前缀，不记录原值
+- SIM / 网络国家、运营商、phoneType、SIM 状态
+- Locale / TimeZone / HTTP agent
+- 关键 Android system properties，用于发现 Device Faker 只改 Build 但底层 prop 仍泄露真实机型的情况
+- Hook OkHttp Request.Builder，遇到 routeLoginCall 时打印服务端真正收到的登录字段
+- phone / device_id / MediaDRM ID / captcha token 自动脱敏，不输出原值
+- HTTP Header 中 Authorization / Cookie / Token / Secret / API key / Signature 自动脱敏
 
-## 编译
-仓库已经带 GitHub Actions。
+## 重点日志
 
-1. 打开 **Actions**
-2. 进入 **Build APK**
-3. 点 **Run workflow**
-4. 构建成功后在 Artifacts 下载 `USIMS-eSIM-Fix-v1.0.0`
-5. 解压后安装 APK
-6. LSPosed 启用模块，作用域只勾 **USIMS**
-7. 重启手机
+安装并重启后：
 
-## 验证
 ```sh
 su -c '/system/bin/logcat -c'
 ```
 
-重新打开 USIMS 后：
+打开 USIMS，点一次登录，然后：
 
 ```sh
 su -c '/system/bin/logcat -d | grep -i USIMSeSIMFix'
 ```
 
+如果日志太多：
+
+```sh
+su -c '/system/bin/logcat -d | grep -i -E "USIMSeSIMFix.*(APP |BUILD|ANDROID|ESIM|FEATURES|ID |TEL |LOCALE|PROP |REQ |BODY |HDR |routeLoginCall|original=)"'
+```
+
 正常会看到：
 
 ```text
-Hook installed: com.wonet.usims.helpers.i.d(Context)
-USIMS eSIM compatibility check -> forced TRUE
+APP package=com.wonet.usims ...
+BUILD manufacturer=Google brand=Google model=GXQ96 device=tegu product=tegu
+ESIM euiccFeature=true euiccService=present,isEnabled=true
+USIMS eSIM compatibility original=... -> forced TRUE
+
+========== routeLoginCall BEGIN ==========
+REQ phone=<redacted ...>
+REQ phone_brand=...
+REQ phone_type=...
+REQ phone_manufacturer=...
+REQ phone_esim_compatible=...
+REQ phone_app_version=...
+REQ device_id=<len=... sha256=...>
+REQ phone_mediadrm_id=<len=... sha256=...>
+REQ captcha_token=<present len=... sha256=...>
+========== routeLoginCall END ==========
 ```
 
-> 注意：此模块只绕过 USIMS 的“设备是否支持 eSIM”本地判断。手机没有真实 EuiccService/LPA 时，系统本身仍不会获得原生 eSIM 安装能力。
+## 注意
+
+这个模块不会把手机真正变成原生 eSIM 设备。它只：
+
+1. 绕过 USIMS 自己的本地兼容判断；
+2. 记录 USIMS 在本机看到的环境；
+3. 记录 routeLoginCall 即将提交的关键字段，敏感值会自动脱敏。
+
+服务器端仍可能根据 Play Integrity 的 appIntegrity / licensing、设备 ID、MediaDRM、账号状态、风控、版本门槛或其他服务端规则拒绝请求。
