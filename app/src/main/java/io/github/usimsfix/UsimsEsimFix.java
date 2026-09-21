@@ -67,7 +67,7 @@ public class UsimsEsimFix extends XposedModule {
         hookUsimsRouteLogin(classLoader);
         hookOkHttpRouteLogin(classLoader);
 
-        log(Log.INFO, TAG, "v1.3.4 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG, "v1.3.5 loaded for " + TARGET_PACKAGE);
     }
 
     private void hookUsimsEsimCheck(ClassLoader classLoader) {
@@ -294,11 +294,18 @@ public class UsimsEsimFix extends XposedModule {
             for (String actualKey : keys) {
                 String normalized = actualKey == null
                         ? "" : actualKey.toLowerCase(Locale.ROOT);
-                if (!wanted.contains(normalized) || obj.isNull(actualKey)) {
+                if (!wanted.contains(normalized)) {
                     continue;
                 }
 
                 found = true;
+
+                if (obj.isNull(actualKey)) {
+                    log(Log.INFO, TAG,
+                            "DIRECT response." + actualKey + "=null");
+                    continue;
+                }
+
                 Object value = obj.opt(actualKey);
 
                 if ("result".equals(normalized)) {
