@@ -19,7 +19,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Arrays;
-import java.util.LinkedHashMap;
+import java.util.HashMap;\nimport java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -119,6 +119,139 @@ public class UsimsEsimFix extends XposedModule {
             log(Log.ERROR, TAG,
                     "Failed to hook USIMS eSIM compatibility method", t);
         }
+    }
+
+    private void hookUsimsRouteLogin(ClassLoader classLoader) {
+        try {
+            Class<?> networkClass = Class.forName("Be.d", false, classLoader);
+            Method target = null;
+
+            for (Method m : networkClass.getDeclaredMethods()) {
+                Class<?>[] p = m.getParameterTypes();
+                if ("c".equals(m.getName())
+                        && p.length == 4
+                        && p[0] == String.class
+                        && java.util.HashMap.class.isAssignableFrom(p[1])
+                        && (p[3] == boolean.class || p[3] == Boolean.class)) {
+                    target = m;
+                    break;
+                }
+            }
+
+            if (target == null) {
+                log(Log.WARN, TAG,
+                        "Direct network hook target not found: Be.d.c(String, HashMap, *, boolean)");
+                return;
+            }
+
+            target.setAccessible(true);
+            final Method hooked = target;
+
+            hook(hooked)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        try {
+                            Object urlObj = chain.getArgs().size() > 0
+                                    ? chain.getArgs().get(0) : null;
+                            Object mapObj = chain.getArgs().size() > 1
+                                    ? chain.getArgs().get(1) : null;
+
+                            String url = String.valueOf(urlObj);
+                            if (url.contains(ROUTE_LOGIN)) {
+                                log(Log.INFO, TAG,
+                                        "========== routeLoginCall DIRECT BEGIN ==========");
+                                log(Log.INFO, TAG,
+                                        "DIRECT method=" + hooked.toGenericString());
+                                log(Log.INFO, TAG,
+                                        "DIRECT url=" + stripQuery(url));
+
+                                if (mapObj instanceof Map) {
+                                    @SuppressWarnings("unchecked")
+                                    Map<Object, Object> map = (Map<Object, Object>) mapObj;
+                                    log(Log.INFO, TAG,
+                                            "DIRECT mapClass=" + mapObj.getClass().getName()
+                                                    + " size=" + map.size());
+
+                                    java.util.List<String> keys = new java.util.ArrayList<>();
+                                    for (Object keyObj : map.keySet()) {
+                                        keys.add(String.valueOf(keyObj));
+                                    }
+                                    java.util.Collections.sort(keys);
+
+                                    for (String key : keys) {
+                                        Object valueObj = map.get(key);
+                                        String value = valueObj == null
+                                                ? "null" : String.valueOf(valueObj);
+                                        log(Log.INFO, TAG,
+                                                "DIRECT " + key + "="
+                                                        + summarizeDirectMapValue(key, value));
+                                    }
+                                } else {
+                                    log(Log.INFO, TAG,
+                                            "DIRECT args[1] is not Map: "
+                                                    + (mapObj == null
+                                                    ? "null" : mapObj.getClass().getName()));
+                                }
+
+                                log(Log.INFO, TAG,
+                                        "========== routeLoginCall DIRECT END ==========");
+                            }
+                        } catch (Throwable t) {
+                            log(Log.WARN, TAG,
+                                    "Direct routeLoginCall diagnostic failed", t);
+                        }
+
+                        return chain.proceed();
+                    });
+
+            log(Log.INFO, TAG,
+                    "Hook installed: Be.d.c(String, HashMap, *, boolean)");
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG,
+                    "Failed to install direct USIMS network hook", t);
+        }
+    }
+
+    private String summarizeDirectMapValue(String key, String value) {
+        if (value == null) {
+            return "null";
+        }
+
+        String lower = key == null ? "" : key.toLowerCase(Locale.ROOT);
+
+        if ("phone_brand".equals(key)
+                || "phone_type".equals(key)
+                || "phone_os_version".equals(key)
+                || "phone_manufacturer".equals(key)
+                || "phone_esim_compatible".equals(key)
+                || "phone_app_version".equals(key)
+                || "app_id".equals(key)) {
+            return truncate(value, 300);
+        }
+
+        if ("phone".equals(key)) {
+            return "<redacted len=" + value.length() + ">";
+        }
+
+        if ("device_id".equals(key)
+                || "phone_mediadrm_id".equals(key)) {
+            return sensitiveSummary(value);
+        }
+
+        if (lower.contains("token")
+                || lower.contains("captcha")
+                || lower.contains("password")
+                || lower.contains("secret")
+                || lower.contains("authorization")
+                || lower.contains("cookie")
+                || lower.contains("signature")
+                || lower.contains("key")) {
+            return "<redacted len=" + value.length()
+                    + " sha256=" + shortHash(value) + ">";
+        }
+
+        return "<len=" + value.length()
+                + " sha256=" + shortHash(value) + ">";
     }
 
     private void hookOkHttpRouteLogin(ClassLoader classLoader) {
