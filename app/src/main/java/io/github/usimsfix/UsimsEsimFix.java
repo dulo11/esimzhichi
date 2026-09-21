@@ -26,6 +26,7 @@ import java.util.Set;
 import java.util.TimeZone;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -39,6 +40,8 @@ public class UsimsEsimFix extends XposedModule {
     private static final String TARGET_PACKAGE = "com.wonet.usims";
     private static final String ROUTE_LOGIN = "routeLoginCall";
     private static final AtomicBoolean ENV_LOGGED = new AtomicBoolean(false);
+    private static final AtomicLong LOGIN_SEQ = new AtomicLong(0);
+    private static volatile Context APP_CONTEXT;
 
     private static final String[] REQUEST_FIELDS = new String[]{
             "phone",
@@ -67,7 +70,12 @@ public class UsimsEsimFix extends XposedModule {
         hookUsimsRouteLogin(classLoader);
         hookOkHttpRouteLogin(classLoader);
 
-        log(Log.INFO, TAG, "v1.3.5 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG, "v1.4.0 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG,
+                "MODULE process=" + safeProcessName()
+                        + " pid=" + android.os.Process.myPid()
+                        + " uid=" + android.os.Process.myUid()
+                        + " classLoader=" + classLoader.getClass().getName());
     }
 
     private void hookUsimsEsimCheck(ClassLoader classLoader) {
@@ -94,6 +102,15 @@ public class UsimsEsimFix extends XposedModule {
                                 context = (Context) chain.getArgs().get(0);
                             }
                         } catch (Throwable ignored) {
+                        }
+
+                        if (context != null) {
+                            try {
+                                Context app = context.getApplicationContext();
+                                APP_CONTEXT = app != null ? app : context;
+                            } catch (Throwable ignored) {
+                                APP_CONTEXT = context;
+                            }
                         }
 
                         if (context != null && ENV_LOGGED.compareAndSet(false, true)) {
@@ -151,29 +168,51 @@ public class UsimsEsimFix extends XposedModule {
             hook(hooked)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept(chain -> {
+                        final long requestId = LOGIN_SEQ.incrementAndGet();
+                        final long startedMs = android.os.SystemClock.elapsedRealtime();
+
                         String url = "";
                         boolean isRouteLogin = false;
 
                         try {
-                            Object urlObj = chain.getArgs().size() > 0
-                                    ? chain.getArgs().get(0) : null;
-                            Object mapObj = chain.getArgs().size() > 1
-                                    ? chain.getArgs().get(1) : null;
+                            java.util.List<?> args = chain.getArgs();
+                            Object urlObj = args.size() > 0 ? args.get(0) : null;
+                            Object mapObj = args.size() > 1 ? args.get(1) : null;
+                            Object callbackObj = args.size() > 2 ? args.get(2) : null;
+                            Object flagObj = args.size() > 3 ? args.get(3) : null;
 
                             url = String.valueOf(urlObj);
                             isRouteLogin = url.contains(ROUTE_LOGIN);
 
                             if (isRouteLogin) {
+                                Thread thread = Thread.currentThread();
+
                                 log(Log.INFO, TAG,
                                         "========== routeLoginCall DIRECT BEGIN ==========");
+                                log(Log.INFO, TAG,
+                                        "DIRECT requestId=" + requestId
+                                                + " pid=" + android.os.Process.myPid()
+                                                + " uid=" + android.os.Process.myUid()
+                                                + " threadId=" + thread.getId()
+                                                + " threadName=" + truncate(thread.getName(), 120));
+                                log(Log.INFO, TAG,
+                                        "DIRECT process=" + safeProcessName()
+                                                + " classLoader=" + classLoader.getClass().getName());
                                 log(Log.INFO, TAG,
                                         "DIRECT method=" + hooked.toGenericString());
                                 log(Log.INFO, TAG,
                                         "DIRECT url=" + stripQuery(url));
+                                log(Log.INFO, TAG,
+                                        "DIRECT argsCount=" + args.size()
+                                                + " callbackClass="
+                                                + (callbackObj == null
+                                                ? "null" : callbackObj.getClass().getName())
+                                                + " flag=" + String.valueOf(flagObj));
 
                                 if (mapObj instanceof Map) {
                                     @SuppressWarnings("unchecked")
                                     Map<Object, Object> map = (Map<Object, Object>) mapObj;
+
                                     log(Log.INFO, TAG,
                                             "DIRECT mapClass=" + mapObj.getClass().getName()
                                                     + " size=" + map.size());
@@ -183,6 +222,9 @@ public class UsimsEsimFix extends XposedModule {
                                         keys.add(String.valueOf(keyObj));
                                     }
                                     java.util.Collections.sort(keys);
+
+                                    log(Log.INFO, TAG, "DIRECT mapKeys=" + keys);
+                                    logRequestShape(map, requestId);
 
                                     for (String key : keys) {
                                         Object valueObj = map.get(key);
@@ -199,6 +241,15 @@ public class UsimsEsimFix extends XposedModule {
                                                     ? "null" : mapObj.getClass().getName()));
                                 }
 
+                                Context ctx = APP_CONTEXT;
+                                if (ctx != null) {
+                                    logNetworkSnapshot(ctx, "DIRECT NET");
+                                    logIdentityConsistency();
+                                } else {
+                                    log(Log.INFO, TAG,
+                                            "DIRECT context=<not-yet-captured>");
+                                }
+
                                 log(Log.INFO, TAG,
                                         "========== routeLoginCall DIRECT END ==========");
                             }
@@ -211,8 +262,16 @@ public class UsimsEsimFix extends XposedModule {
                             Object result = chain.proceed();
 
                             if (isRouteLogin) {
+                                long elapsedMs =
+                                        android.os.SystemClock.elapsedRealtime() - startedMs;
+
                                 log(Log.INFO, TAG,
                                         "========== routeLoginCall RESPONSE BEGIN ==========");
+                                log(Log.INFO, TAG,
+                                        "DIRECT response.requestId=" + requestId
+                                                + " elapsedMs=" + elapsedMs
+                                                + " responseThread="
+                                                + truncate(Thread.currentThread().getName(), 120));
                                 logDirectLoginResponse(result);
                                 log(Log.INFO, TAG,
                                         "========== routeLoginCall RESPONSE END ==========");
@@ -221,11 +280,15 @@ public class UsimsEsimFix extends XposedModule {
                             return result;
                         } catch (Throwable t) {
                             if (isRouteLogin) {
+                                long elapsedMs =
+                                        android.os.SystemClock.elapsedRealtime() - startedMs;
                                 log(Log.ERROR, TAG,
-                                        "routeLoginCall threw "
-                                                + t.getClass().getName()
+                                        "routeLoginCall threw requestId=" + requestId
+                                                + " elapsedMs=" + elapsedMs
+                                                + " type=" + t.getClass().getName()
                                                 + " message="
                                                 + summarizeThrowableMessage(t.getMessage()));
+                                logThrowableFrames("DIRECT throwable", t, 8);
                             }
                             throw t;
                         }
@@ -236,6 +299,47 @@ public class UsimsEsimFix extends XposedModule {
         } catch (Throwable t) {
             log(Log.ERROR, TAG,
                     "Failed to install direct USIMS network hook", t);
+        }
+    }
+
+    private void logRequestShape(Map<Object, Object> map, long requestId) {
+        try {
+            java.util.List<String> keys = new java.util.ArrayList<>();
+            for (Object key : map.keySet()) {
+                keys.add(String.valueOf(key));
+            }
+            java.util.Collections.sort(keys);
+
+            StringBuilder shape = new StringBuilder();
+            for (String key : keys) {
+                Object value = map.get(key);
+                String text = value == null ? "" : String.valueOf(value);
+                shape.append(key)
+                        .append(':')
+                        .append(value == null ? "null" : value.getClass().getName())
+                        .append(':')
+                        .append(text.length())
+                        .append(';');
+            }
+
+            log(Log.INFO, TAG,
+                    "DIRECT requestShape requestId=" + requestId
+                            + " sha256=" + shortHash(shape.toString())
+                            + " keyCount=" + keys.size());
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "DIRECT request shape diagnostic failed", t);
+        }
+    }
+
+    private void logThrowableFrames(String label, Throwable t, int maxFrames) {
+        try {
+            StackTraceElement[] frames = t.getStackTrace();
+            int n = Math.min(frames == null ? 0 : frames.length, maxFrames);
+            for (int i = 0; i < n; i++) {
+                log(Log.INFO, TAG,
+                        label + "[" + i + "]=" + String.valueOf(frames[i]));
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -335,7 +439,7 @@ public class UsimsEsimFix extends XposedModule {
             return;
         }
 
-        if (depth > 2) {
+        if (depth > 3) {
             String text = String.valueOf(value);
             log(Log.INFO, TAG,
                     label + "=<depth-limit type=" + value.getClass().getName()
@@ -352,45 +456,47 @@ public class UsimsEsimFix extends XposedModule {
                 keys.add(it.next());
             }
             java.util.Collections.sort(keys);
-            log(Log.INFO, TAG, label + "Keys=" + keys);
 
-            java.util.Set<String> readable = new java.util.HashSet<>(
-                    java.util.Arrays.asList(
-                            "code",
-                            "status",
-                            "success",
-                            "message",
-                            "msg",
-                            "error",
-                            "error_code",
-                            "errorcode",
-                            "reason",
-                            "compatible",
-                            "compatibility",
-                            "device_compatible",
-                            "devicecompatible",
-                            "supported",
-                            "min_version",
-                            "minversion",
-                            "latest_version",
-                            "latestversion",
-                            "app_version",
-                            "appversion"
-                    )
-            );
+            log(Log.INFO, TAG, label + "Keys=" + keys);
 
             for (String key : keys) {
                 Object nested = obj.opt(key);
-                String normalized = key == null
-                        ? "" : key.toLowerCase(Locale.ROOT);
+                String child = label + "." + key;
 
-                if (readable.contains(normalized)) {
+                if (nested == null || nested == JSONObject.NULL) {
+                    log(Log.INFO, TAG, child + "=null");
+                    continue;
+                }
+
+                if (isSensitiveKey(key)) {
+                    String text = String.valueOf(nested);
                     log(Log.INFO, TAG,
-                            label + "." + key + "="
-                                    + summarizeResponseValue(key, nested));
-                } else if (nested instanceof JSONObject
+                            child + "=<redacted type=" + nested.getClass().getName()
+                                    + " len=" + text.length()
+                                    + " sha256=" + shortHash(text) + ">");
+                    continue;
+                }
+
+                if (nested instanceof JSONObject
                         || nested instanceof org.json.JSONArray) {
-                    logResultStructure(label + "." + key, nested, depth + 1);
+                    logResultStructure(child, nested, depth + 1);
+                    continue;
+                }
+
+                if (nested instanceof Boolean || nested instanceof Number) {
+                    log(Log.INFO, TAG, child + "=" + String.valueOf(nested));
+                    continue;
+                }
+
+                String text = String.valueOf(nested);
+                if (isReadableDiagnosticKey(key)
+                        && !looksSensitiveResponseText(text)) {
+                    log(Log.INFO, TAG, child + "=" + truncate(text, 1000));
+                } else {
+                    log(Log.INFO, TAG,
+                            child + "=<type=" + nested.getClass().getName()
+                                    + " len=" + text.length()
+                                    + " sha256=" + shortHash(text) + ">");
                 }
             }
             return;
@@ -400,12 +506,25 @@ public class UsimsEsimFix extends XposedModule {
             org.json.JSONArray array = (org.json.JSONArray) value;
             log(Log.INFO, TAG,
                     label + "=<array length=" + array.length() + ">");
-            int inspect = Math.min(array.length(), 3);
+
+            int inspect = Math.min(array.length(), 5);
             for (int i = 0; i < inspect; i++) {
                 Object item = array.opt(i);
-                if (item instanceof JSONObject
+                String child = label + "[" + i + "]";
+
+                if (item == null || item == JSONObject.NULL) {
+                    log(Log.INFO, TAG, child + "=null");
+                } else if (item instanceof JSONObject
                         || item instanceof org.json.JSONArray) {
-                    logResultStructure(label + "[" + i + "]", item, depth + 1);
+                    logResultStructure(child, item, depth + 1);
+                } else if (item instanceof Boolean || item instanceof Number) {
+                    log(Log.INFO, TAG, child + "=" + String.valueOf(item));
+                } else {
+                    String text = String.valueOf(item);
+                    log(Log.INFO, TAG,
+                            child + "=<type=" + item.getClass().getName()
+                                    + " len=" + text.length()
+                                    + " sha256=" + shortHash(text) + ">");
                 }
             }
             return;
@@ -418,6 +537,7 @@ public class UsimsEsimFix extends XposedModule {
 
         String text = String.valueOf(value);
         String trimmed = text.trim();
+
         log(Log.INFO, TAG,
                 label + "=<type=" + value.getClass().getName()
                         + " len=" + text.length()
@@ -436,6 +556,61 @@ public class UsimsEsimFix extends XposedModule {
             } catch (Throwable ignored) {
             }
         }
+    }
+
+    private boolean isReadableDiagnosticKey(String key) {
+        if (key == null) {
+            return false;
+        }
+
+        String normalized = key.toLowerCase(Locale.ROOT);
+        return normalized.equals("code")
+                || normalized.equals("status")
+                || normalized.equals("success")
+                || normalized.equals("message")
+                || normalized.equals("msg")
+                || normalized.equals("error")
+                || normalized.equals("error_code")
+                || normalized.equals("errorcode")
+                || normalized.equals("reason")
+                || normalized.equals("compatible")
+                || normalized.equals("compatibility")
+                || normalized.equals("device_compatible")
+                || normalized.equals("devicecompatible")
+                || normalized.equals("supported")
+                || normalized.equals("min_version")
+                || normalized.equals("minversion")
+                || normalized.equals("latest_version")
+                || normalized.equals("latestversion")
+                || normalized.equals("app_version")
+                || normalized.equals("appversion")
+                || normalized.equals("version")
+                || normalized.equals("type")
+                || normalized.equals("state");
+    }
+
+    private boolean isSensitiveKey(String key) {
+        if (key == null) {
+            return false;
+        }
+
+        String lower = key.toLowerCase(Locale.ROOT);
+        return lower.contains("token")
+                || lower.contains("authorization")
+                || lower.contains("cookie")
+                || lower.contains("session")
+                || lower.contains("secret")
+                || lower.contains("password")
+                || lower.contains("phone")
+                || lower.contains("mobile")
+                || lower.contains("email")
+                || lower.contains("device_id")
+                || lower.contains("mediadrm")
+                || lower.contains("android_id")
+                || lower.contains("signature")
+                || lower.contains("captcha")
+                || lower.equals("key")
+                || lower.endsWith("_key");
     }
 
     private String summarizeResponseValue(String key, Object value) {
@@ -873,18 +1048,206 @@ public class UsimsEsimFix extends XposedModule {
                             + " radio=" + safeRadioVersion()
                             + " abis=" + Arrays.toString(Build.SUPPORTED_ABIS));
 
+            logAppRuntime(context, self);
             logEsim(context, pm);
             logSelectedFeatures(pm);
             logIdentifiers(context);
             logTelephony(context);
+            logNetworkSnapshot(context, "NET");
             logLocaleAndAgent();
             logSystemProperties();
+            logIdentityConsistency();
 
         } catch (Throwable t) {
             log(Log.WARN, TAG, "Environment diagnostic failed", t);
         }
 
         log(Log.INFO, TAG, "========== ENVIRONMENT END ==========");
+    }
+
+    private void logAppRuntime(Context context, PackageInfo self) {
+        try {
+            android.content.pm.ApplicationInfo ai =
+                    context.getPackageManager().getApplicationInfo(
+                            context.getPackageName(), 0);
+
+            log(Log.INFO, TAG,
+                    "RUNTIME process=" + safeProcessName()
+                            + " pid=" + android.os.Process.myPid()
+                            + " uid=" + android.os.Process.myUid()
+                            + " targetSdk=" + ai.targetSdkVersion
+                            + " minSdk=" + ai.minSdkVersion
+                            + " debuggable="
+                            + ((ai.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0)
+                            + " sourceDir=" + truncate(ai.sourceDir, 300));
+
+            log(Log.INFO, TAG,
+                    "RUNTIME vmName=" + System.getProperty("java.vm.name")
+                            + " vmVersion=" + System.getProperty("java.vm.version")
+                            + " osArch=" + System.getProperty("os.arch")
+                            + " processors=" + Runtime.getRuntime().availableProcessors());
+
+            if (Build.VERSION.SDK_INT >= 30) {
+                try {
+                    android.content.pm.InstallSourceInfo isi =
+                            context.getPackageManager()
+                                    .getInstallSourceInfo(context.getPackageName());
+
+                    log(Log.INFO, TAG,
+                            "INSTALL initiating="
+                                    + isi.getInitiatingPackageName()
+                                    + " installing="
+                                    + isi.getInstallingPackageName()
+                                    + " originating="
+                                    + isi.getOriginatingPackageName());
+                } catch (Throwable t) {
+                    log(Log.INFO, TAG,
+                            "INSTALL source=<unavailable:"
+                                    + t.getClass().getSimpleName() + ">");
+                }
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Runtime diagnostic failed", t);
+        }
+    }
+
+    private void logNetworkSnapshot(Context context, String prefix) {
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager)
+                            context.getSystemService(Context.CONNECTIVITY_SERVICE);
+
+            if (cm == null) {
+                log(Log.INFO, TAG, prefix + " connectivityService=null");
+                return;
+            }
+
+            android.net.Network network = cm.getActiveNetwork();
+            android.net.NetworkCapabilities caps =
+                    network == null ? null : cm.getNetworkCapabilities(network);
+            android.net.LinkProperties link =
+                    network == null ? null : cm.getLinkProperties(network);
+
+            StringBuilder transports = new StringBuilder();
+            if (caps != null) {
+                if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
+                    transports.append("WIFI,");
+                }
+                if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                    transports.append("CELLULAR,");
+                }
+                if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) {
+                    transports.append("VPN,");
+                }
+                if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                    transports.append("ETHERNET,");
+                }
+                if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_BLUETOOTH)) {
+                    transports.append("BLUETOOTH,");
+                }
+            }
+
+            String privateDns = "<none>";
+            String proxy = "<none>";
+
+            if (link != null) {
+                try {
+                    String p = link.getPrivateDnsServerName();
+                    if (p != null && !p.isEmpty()) {
+                        privateDns = p;
+                    }
+                } catch (Throwable ignored) {
+                }
+
+                try {
+                    android.net.ProxyInfo pi = link.getHttpProxy();
+                    if (pi != null) {
+                        proxy = truncate(
+                                String.valueOf(pi.getHost()) + ":" + pi.getPort(),
+                                200
+                        );
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
+            log(Log.INFO, TAG,
+                    prefix
+                            + " active=" + (network != null)
+                            + " transports=" + transports
+                            + " metered=" + cm.isActiveNetworkMetered()
+                            + " validated="
+                            + (caps != null
+                            && caps.hasCapability(
+                            android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+                            + " internet="
+                            + (caps != null
+                            && caps.hasCapability(
+                            android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET))
+                            + " privateDns=" + privateDns
+                            + " proxy=" + proxy);
+        } catch (Throwable t) {
+            log(Log.INFO, TAG,
+                    prefix + " <unavailable:"
+                            + t.getClass().getSimpleName() + ">");
+        }
+    }
+
+    private void logIdentityConsistency() {
+        try {
+            String propManufacturer =
+                    readSystemProperty("ro.product.manufacturer");
+            String propBrand =
+                    readSystemProperty("ro.product.brand");
+            String propModel =
+                    readSystemProperty("ro.product.model");
+            String propDevice =
+                    readSystemProperty("ro.product.device");
+            String propName =
+                    readSystemProperty("ro.product.name");
+            String propFingerprint =
+                    readSystemProperty("ro.build.fingerprint");
+
+            log(Log.INFO, TAG,
+                    "IDENTITY_MATCH manufacturer="
+                            + safeEquals(Build.MANUFACTURER, propManufacturer)
+                            + " brand=" + safeEquals(Build.BRAND, propBrand)
+                            + " model=" + safeEquals(Build.MODEL, propModel)
+                            + " device=" + safeEquals(Build.DEVICE, propDevice)
+                            + " product=" + safeEquals(Build.PRODUCT, propName)
+                            + " fingerprint="
+                            + safeEquals(Build.FINGERPRINT, propFingerprint));
+        } catch (Throwable t) {
+            log(Log.INFO, TAG,
+                    "IDENTITY_MATCH <unavailable:"
+                            + t.getClass().getSimpleName() + ">");
+        }
+    }
+
+    private String readSystemProperty(String key) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Method get = sp.getDeclaredMethod("get", String.class, String.class);
+            get.setAccessible(true);
+            Object value = get.invoke(null, key, "");
+            return value == null ? "" : String.valueOf(value);
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private boolean safeEquals(String a, String b) {
+        return a == null ? b == null : a.equals(b);
+    }
+
+    private String safeProcessName() {
+        try {
+            if (Build.VERSION.SDK_INT >= 28) {
+                return String.valueOf(android.app.Application.getProcessName());
+            }
+        } catch (Throwable ignored) {
+        }
+        return "<unavailable>";
     }
 
     private void logEsim(Context context, PackageManager pm) {
