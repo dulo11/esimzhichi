@@ -39,6 +39,8 @@ public class UsimsEsimFix extends XposedModule {
     private static final String TAG = "USIMSeSIMFix";
     private static final String TARGET_PACKAGE = "com.wonet.usims";
     private static final String ROUTE_LOGIN = "routeLoginCall";
+    private static final String INTEGRITY_NONCE = "generatePlayIntegrityNonce";
+    private static final String INTEGRITY_VALIDATE = "validatePlayIntegrityToken";
     private static final AtomicBoolean ENV_LOGGED = new AtomicBoolean(false);
     private static final AtomicLong LOGIN_SEQ = new AtomicLong(0);
     private static volatile Context APP_CONTEXT;
@@ -70,9 +72,9 @@ public class UsimsEsimFix extends XposedModule {
         hookUsimsRouteLogin(classLoader);
         hookOkHttpRouteLogin(classLoader);
 
-        log(Log.INFO, TAG, "v1.4.0 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG, "v1.4.1 loaded for " + TARGET_PACKAGE);
         log(Log.INFO, TAG,
-                "MODULE process=" + safeProcessName()
+                "MODULE diagnostics=routeLogin+PlayIntegrityReadOnly process=" + safeProcessName()
                         + " pid=" + android.os.Process.myPid()
                         + " uid=" + android.os.Process.myUid()
                         + " classLoader=" + classLoader.getClass().getName());
@@ -173,6 +175,9 @@ public class UsimsEsimFix extends XposedModule {
 
                         String url = "";
                         boolean isRouteLogin = false;
+                        boolean isIntegrityNonce = false;
+                        boolean isIntegrityValidate = false;
+                        String endpointName = null;
 
                         try {
                             java.util.List<?> args = chain.getArgs();
@@ -183,12 +188,19 @@ public class UsimsEsimFix extends XposedModule {
 
                             url = String.valueOf(urlObj);
                             isRouteLogin = url.contains(ROUTE_LOGIN);
+                            isIntegrityNonce = url.contains(INTEGRITY_NONCE);
+                            isIntegrityValidate = url.contains(INTEGRITY_VALIDATE);
+                            endpointName = isRouteLogin
+                                    ? ROUTE_LOGIN
+                                    : (isIntegrityNonce
+                                    ? INTEGRITY_NONCE
+                                    : (isIntegrityValidate ? INTEGRITY_VALIDATE : null));
 
-                            if (isRouteLogin) {
+                            if (endpointName != null) {
                                 Thread thread = Thread.currentThread();
 
                                 log(Log.INFO, TAG,
-                                        "========== routeLoginCall DIRECT BEGIN ==========");
+                                        "========== " + endpointName + " DIRECT BEGIN ==========");
                                 log(Log.INFO, TAG,
                                         "DIRECT requestId=" + requestId
                                                 + " pid=" + android.os.Process.myPid()
@@ -251,7 +263,7 @@ public class UsimsEsimFix extends XposedModule {
                                 }
 
                                 log(Log.INFO, TAG,
-                                        "========== routeLoginCall DIRECT END ==========");
+                                        "========== " + endpointName + " DIRECT END ==========");
                             }
                         } catch (Throwable t) {
                             log(Log.WARN, TAG,
@@ -261,29 +273,30 @@ public class UsimsEsimFix extends XposedModule {
                         try {
                             Object result = chain.proceed();
 
-                            if (isRouteLogin) {
+                            if (endpointName != null) {
                                 long elapsedMs =
                                         android.os.SystemClock.elapsedRealtime() - startedMs;
 
                                 log(Log.INFO, TAG,
-                                        "========== routeLoginCall RESPONSE BEGIN ==========");
+                                        "========== " + endpointName + " RESPONSE BEGIN ==========");
                                 log(Log.INFO, TAG,
                                         "DIRECT response.requestId=" + requestId
+                                                + " endpoint=" + endpointName
                                                 + " elapsedMs=" + elapsedMs
                                                 + " responseThread="
                                                 + truncate(Thread.currentThread().getName(), 120));
                                 logDirectLoginResponse(result);
                                 log(Log.INFO, TAG,
-                                        "========== routeLoginCall RESPONSE END ==========");
+                                        "========== " + endpointName + " RESPONSE END ==========");
                             }
 
                             return result;
                         } catch (Throwable t) {
-                            if (isRouteLogin) {
+                            if (endpointName != null) {
                                 long elapsedMs =
                                         android.os.SystemClock.elapsedRealtime() - startedMs;
                                 log(Log.ERROR, TAG,
-                                        "routeLoginCall threw requestId=" + requestId
+                                        endpointName + " threw requestId=" + requestId
                                                 + " elapsedMs=" + elapsedMs
                                                 + " type=" + t.getClass().getName()
                                                 + " message="
