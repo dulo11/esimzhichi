@@ -33,11 +33,18 @@ jobs:
       - name: Build installable debug APK
         run: gradle :app:assembleDebug --stacktrace
 
+      - name: Read app version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/.*versionName "\([^"]*\)".*/\1/p' app/build.gradle | head -n1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk USIMS-eSIM-Fix-v1.3.1.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk "USIMS-eSIM-Fix-v${{ steps.version.outputs.version }}.apk"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: USIMS-eSIM-Fix-v1.3.1
-          path: USIMS-eSIM-Fix-v1.3.1.apk
+          name: USIMS-eSIM-Fix-v${{ steps.version.outputs.version }}
+          path: USIMS-eSIM-Fix-v${{ steps.version.outputs.version }}.apk
