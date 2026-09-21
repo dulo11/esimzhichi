@@ -74,13 +74,15 @@ public class UsimsEsimFix extends XposedModule {
 
         hookCompatibilityPreferenceReads();
         hookPlayIntegrityFactory(classLoader);
+        hookRecaptchaFactory(classLoader);
         hookUsimsEsimCheck(classLoader);
         hookUsimsRouteLogin(classLoader);
+        hookAdditionalUsimsNetworkMethods(classLoader);
         hookOkHttpRouteLogin(classLoader);
 
-        log(Log.INFO, TAG, "v1.4.3 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG, "v1.4.4 loaded for " + TARGET_PACKAGE);
         log(Log.INFO, TAG,
-                "MODULE diagnostics=routeLogin+prefs+PlayIntegrityTaskCompletion process=" + safeProcessName()
+                "MODULE diagnostics=routeLogin+prefs+PlayIntegrity+Recaptcha+networkPath process=" + safeProcessName()
                         + " pid=" + android.os.Process.myPid()
                         + " uid=" + android.os.Process.myUid()
                         + " classLoader=" + classLoader.getClass().getName());
@@ -727,6 +729,563 @@ public class UsimsEsimFix extends XposedModule {
                 log(Log.INFO, TAG, label + "=<no-interesting-frames>");
             }
         } catch (Throwable ignored) {
+        }
+    }
+
+    private void hookRecaptchaFactory(ClassLoader classLoader) {
+        try {
+            Class<?> recaptcha = Class.forName(
+                    "com.google.android.recaptcha.Recaptcha",
+                    false,
+                    classLoader
+            );
+
+            int installed = 0;
+            for (Method method : recaptcha.getDeclaredMethods()) {
+                if (!"fetchTaskClient".equals(method.getName())) {
+                    continue;
+                }
+
+                method.setAccessible(true);
+                final Method hooked = method;
+
+                hook(hooked)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            long started =
+                                    android.os.SystemClock.elapsedRealtime();
+
+                            log(Log.INFO, TAG,
+                                    "RECAPTCHA_FETCH BEGIN method="
+                                            + hooked.toGenericString()
+                                            + " argTypes="
+                                            + summarizeArgTypes(chain.getArgs()));
+                            logInterestingStack("RECAPTCHA_FETCH caller", 8);
+
+                            Object task = chain.proceed();
+
+                            log(Log.INFO, TAG,
+                                    "RECAPTCHA_FETCH END returnClass="
+                                            + (task == null
+                                            ? "null"
+                                            : task.getClass().getName()));
+
+                            if (task != null) {
+                                attachRecaptchaClientTaskDiagnostic(
+                                        task,
+                                        started
+                                );
+                            }
+
+                            return task;
+                        });
+                installed++;
+            }
+
+            log(Log.INFO, TAG,
+                    "Hook installed: Recaptcha.fetchTaskClient methods="
+                            + installed);
+        } catch (Throwable t) {
+            log(Log.INFO, TAG,
+                    "Recaptcha.fetchTaskClient unavailable: "
+                            + t.getClass().getSimpleName());
+        }
+    }
+
+    private void attachRecaptchaClientTaskDiagnostic(
+            Object task,
+            long startedMs) {
+        try {
+            Method addOnComplete = null;
+            Class<?> listenerType = null;
+
+            for (Method method : task.getClass().getMethods()) {
+                if (!"addOnCompleteListener".equals(method.getName())) {
+                    continue;
+                }
+
+                Class<?>[] p = method.getParameterTypes();
+                if (p.length == 1
+                        && p[0].getName().endsWith(".OnCompleteListener")) {
+                    addOnComplete = method;
+                    listenerType = p[0];
+                    break;
+                }
+            }
+
+            if (addOnComplete == null || listenerType == null) {
+                log(Log.INFO, TAG,
+                        "RECAPTCHA_FETCH listener-unavailable taskClass="
+                                + task.getClass().getName());
+                return;
+            }
+
+            final Class<?> finalListenerType = listenerType;
+            Object listener = java.lang.reflect.Proxy.newProxyInstance(
+                    finalListenerType.getClassLoader(),
+                    new Class[]{finalListenerType},
+                    (proxy, method, args) -> {
+                        if ("onComplete".equals(method.getName())
+                                && args != null
+                                && args.length > 0
+                                && args[0] != null) {
+                            Object completed = args[0];
+                            long elapsed =
+                                    android.os.SystemClock.elapsedRealtime()
+                                            - startedMs;
+
+                            boolean success =
+                                    booleanNoArg(
+                                            completed,
+                                            "isSuccessful",
+                                            false
+                                    );
+
+                            Throwable exception = null;
+                            try {
+                                Object ex =
+                                        invokeNoArgs(
+                                                completed,
+                                                "getException"
+                                        );
+                                if (ex instanceof Throwable) {
+                                    exception = (Throwable) ex;
+                                }
+                            } catch (Throwable ignored) {
+                            }
+
+                            log(Log.INFO, TAG,
+                                    "RECAPTCHA_FETCH COMPLETE elapsedMs="
+                                            + elapsed
+                                            + " successful=" + success
+                                            + " exceptionClass="
+                                            + (exception == null
+                                            ? "null"
+                                            : exception.getClass().getName())
+                                            + " exceptionMessage="
+                                            + (exception == null
+                                            ? "null"
+                                            : summarizeThrowableMessage(
+                                            exception.getMessage()
+                                    )));
+
+                            if (success) {
+                                try {
+                                    Object client =
+                                            invokeNoArgs(
+                                                    completed,
+                                                    "getResult"
+                                            );
+
+                                    log(Log.INFO, TAG,
+                                            "RECAPTCHA_CLIENT obtained class="
+                                                    + (client == null
+                                                    ? "null"
+                                                    : client.getClass()
+                                                            .getName()));
+
+                                    if (client != null) {
+                                        hookRecaptchaRuntimeClient(client);
+                                    }
+                                } catch (Throwable t) {
+                                    log(Log.WARN, TAG,
+                                            "RECAPTCHA_CLIENT inspect failed type="
+                                                    + t.getClass()
+                                                            .getSimpleName());
+                                }
+                            }
+                        }
+
+                        if ("toString".equals(method.getName())) {
+                            return "USIMSeSIMFixRecaptchaListener";
+                        }
+                        if ("hashCode".equals(method.getName())) {
+                            return System.identityHashCode(proxy);
+                        }
+                        if ("equals".equals(method.getName())) {
+                            return args != null
+                                    && args.length == 1
+                                    && proxy == args[0];
+                        }
+                        return null;
+                    }
+            );
+
+            addOnComplete.setAccessible(true);
+            addOnComplete.invoke(task, listener);
+            log(Log.INFO, TAG,
+                    "RECAPTCHA_FETCH listener-attached taskClass="
+                            + task.getClass().getName());
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "RECAPTCHA_FETCH listener attach failed type="
+                            + t.getClass().getSimpleName(),
+                    t);
+        }
+    }
+
+    private void hookRecaptchaRuntimeClient(Object client) {
+        try {
+            Class<?> cls = client.getClass();
+
+            for (Method method : cls.getMethods()) {
+                if (!"executeTask".equals(method.getName())) {
+                    continue;
+                }
+
+                String id =
+                        "recaptcha#" + cls.getName()
+                                + "#" + method.toGenericString();
+
+                if (!HOOKED_INTEGRITY_METHODS.add(id)) {
+                    continue;
+                }
+
+                method.setAccessible(true);
+                final Method hooked = method;
+
+                try {
+                    hook(hooked)
+                            .setExceptionMode(
+                                    XposedInterface.ExceptionMode.PROTECTIVE
+                            )
+                            .intercept(chain -> {
+                                long started =
+                                        android.os.SystemClock.elapsedRealtime();
+
+                                log(Log.INFO, TAG,
+                                        "RECAPTCHA_EXEC BEGIN method="
+                                                + hooked.toGenericString()
+                                                + " argTypes="
+                                                + summarizeArgTypes(
+                                                chain.getArgs()
+                                        ));
+                                logInterestingStack(
+                                        "RECAPTCHA_EXEC caller",
+                                        10
+                                );
+
+                                Object result = chain.proceed();
+
+                                log(Log.INFO, TAG,
+                                        "RECAPTCHA_EXEC END returnClass="
+                                                + (result == null
+                                                ? "null"
+                                                : result.getClass()
+                                                        .getName()));
+
+                                if (result != null) {
+                                    attachSimpleTaskCompletionDiagnostic(
+                                            result,
+                                            "recaptcha.executeTask",
+                                            started
+                                    );
+                                }
+
+                                return result;
+                            });
+
+                    log(Log.INFO, TAG,
+                            "Hook installed: recaptcha runtime method="
+                                    + hooked.toGenericString());
+                } catch (Throwable hookError) {
+                    log(Log.WARN, TAG,
+                            "Recaptcha runtime hook failed: "
+                                    + hooked.toGenericString(),
+                            hookError);
+                }
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "Recaptcha runtime client diagnostic failed", t);
+        }
+    }
+
+    private void attachSimpleTaskCompletionDiagnostic(
+            Object task,
+            String label,
+            long startedMs) {
+        try {
+            Method addOnComplete = null;
+            Class<?> listenerType = null;
+
+            for (Method method : task.getClass().getMethods()) {
+                if (!"addOnCompleteListener".equals(method.getName())) {
+                    continue;
+                }
+
+                Class<?>[] p = method.getParameterTypes();
+                if (p.length == 1
+                        && p[0].getName().endsWith(".OnCompleteListener")) {
+                    addOnComplete = method;
+                    listenerType = p[0];
+                    break;
+                }
+            }
+
+            if (addOnComplete == null || listenerType == null) {
+                log(Log.INFO, TAG,
+                        "TASK_DIAG listener-unavailable label="
+                                + label);
+                return;
+            }
+
+            final Class<?> finalListenerType = listenerType;
+
+            Object listener = java.lang.reflect.Proxy.newProxyInstance(
+                    finalListenerType.getClassLoader(),
+                    new Class[]{finalListenerType},
+                    (proxy, method, args) -> {
+                        if ("onComplete".equals(method.getName())
+                                && args != null
+                                && args.length > 0
+                                && args[0] != null) {
+                            Object completed = args[0];
+                            long elapsed =
+                                    android.os.SystemClock.elapsedRealtime()
+                                            - startedMs;
+
+                            boolean complete =
+                                    booleanNoArg(
+                                            completed,
+                                            "isComplete",
+                                            true
+                                    );
+                            boolean success =
+                                    booleanNoArg(
+                                            completed,
+                                            "isSuccessful",
+                                            false
+                                    );
+                            boolean canceled =
+                                    booleanNoArg(
+                                            completed,
+                                            "isCanceled",
+                                            false
+                                    );
+
+                            Throwable exception = null;
+                            try {
+                                Object ex =
+                                        invokeNoArgs(
+                                                completed,
+                                                "getException"
+                                        );
+                                if (ex instanceof Throwable) {
+                                    exception = (Throwable) ex;
+                                }
+                            } catch (Throwable ignored) {
+                            }
+
+                            log(Log.INFO, TAG,
+                                    "TASK_DIAG COMPLETE label="
+                                            + label
+                                            + " elapsedMs=" + elapsed
+                                            + " complete=" + complete
+                                            + " successful=" + success
+                                            + " canceled=" + canceled
+                                            + " exceptionClass="
+                                            + (exception == null
+                                            ? "null"
+                                            : exception.getClass().getName())
+                                            + " exceptionMessage="
+                                            + (exception == null
+                                            ? "null"
+                                            : summarizeThrowableMessage(
+                                            exception.getMessage()
+                                    )));
+                        }
+
+                        if ("toString".equals(method.getName())) {
+                            return "USIMSeSIMFixTaskListener(" + label + ")";
+                        }
+                        if ("hashCode".equals(method.getName())) {
+                            return System.identityHashCode(proxy);
+                        }
+                        if ("equals".equals(method.getName())) {
+                            return args != null
+                                    && args.length == 1
+                                    && proxy == args[0];
+                        }
+                        return null;
+                    }
+            );
+
+            addOnComplete.setAccessible(true);
+            addOnComplete.invoke(task, listener);
+
+            log(Log.INFO, TAG,
+                    "TASK_DIAG listener-attached label="
+                            + label
+                            + " taskClass="
+                            + task.getClass().getName());
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "TASK_DIAG listener attach failed label="
+                            + label
+                            + " type="
+                            + t.getClass().getSimpleName(),
+                    t);
+        }
+    }
+
+    private void hookAdditionalUsimsNetworkMethods(ClassLoader classLoader) {
+        try {
+            Class<?> networkClass =
+                    Class.forName("Be.d", false, classLoader);
+
+            int installed = 0;
+
+            for (Method method : networkClass.getDeclaredMethods()) {
+                Class<?>[] p = method.getParameterTypes();
+
+                if (p.length == 0 || p[0] != String.class) {
+                    continue;
+                }
+
+                boolean isMainC =
+                        "c".equals(method.getName())
+                                && p.length == 4
+                                && java.util.HashMap.class
+                                        .isAssignableFrom(p[1])
+                                && (p[3] == boolean.class
+                                || p[3] == Boolean.class);
+
+                if (isMainC) {
+                    continue;
+                }
+
+                method.setAccessible(true);
+                final Method hooked = method;
+
+                try {
+                    hook(hooked)
+                            .setExceptionMode(
+                                    XposedInterface.ExceptionMode.PROTECTIVE
+                            )
+                            .intercept(chain -> {
+                                java.util.List<?> args =
+                                        chain.getArgs();
+
+                                String url =
+                                        args.isEmpty()
+                                                ? ""
+                                                : String.valueOf(
+                                                args.get(0)
+                                        );
+
+                                boolean usimsApi =
+                                        url.contains("api.usims.com");
+
+                                long started =
+                                        android.os.SystemClock.elapsedRealtime();
+
+                                if (usimsApi) {
+                                    log(Log.INFO, TAG,
+                                            "NET_ANY BEGIN method="
+                                                    + hooked.toGenericString()
+                                                    + " url="
+                                                    + stripQuery(url)
+                                                    + " argTypes="
+                                                    + summarizeArgTypes(args));
+
+                                    for (Object arg : args) {
+                                        if (!(arg instanceof Map)) {
+                                            continue;
+                                        }
+
+                                        @SuppressWarnings("unchecked")
+                                        Map<Object, Object> map =
+                                                (Map<Object, Object>) arg;
+
+                                        java.util.List<String> keys =
+                                                new java.util.ArrayList<>();
+
+                                        for (Object key : map.keySet()) {
+                                            keys.add(
+                                                    String.valueOf(key)
+                                            );
+                                        }
+
+                                        java.util.Collections.sort(keys);
+
+                                        log(Log.INFO, TAG,
+                                                "NET_ANY mapKeys="
+                                                        + keys
+                                                        + " size="
+                                                        + map.size());
+
+                                        for (String key : keys) {
+                                            Object v = map.get(key);
+                                            String text =
+                                                    v == null
+                                                            ? "null"
+                                                            : String.valueOf(v);
+
+                                            log(Log.INFO, TAG,
+                                                    "NET_ANY "
+                                                            + key
+                                                            + "="
+                                                            + summarizeDirectMapValue(
+                                                            key,
+                                                            text
+                                                    ));
+                                        }
+                                    }
+                                }
+
+                                try {
+                                    Object result =
+                                            chain.proceed();
+
+                                    if (usimsApi) {
+                                        long elapsed =
+                                                android.os.SystemClock
+                                                        .elapsedRealtime()
+                                                        - started;
+
+                                        log(Log.INFO, TAG,
+                                                "NET_ANY RESPONSE elapsedMs="
+                                                        + elapsed
+                                                        + " returnClass="
+                                                        + (result == null
+                                                        ? "null"
+                                                        : result.getClass()
+                                                                .getName()));
+                                        logDirectLoginResponse(result);
+                                    }
+
+                                    return result;
+                                } catch (Throwable t) {
+                                    if (usimsApi) {
+                                        log(Log.ERROR, TAG,
+                                                "NET_ANY threw type="
+                                                        + t.getClass()
+                                                                .getName()
+                                                        + " message="
+                                                        + summarizeThrowableMessage(
+                                                        t.getMessage()
+                                                ));
+                                    }
+                                    throw t;
+                                }
+                            });
+
+                    installed++;
+                } catch (Throwable hookError) {
+                    log(Log.WARN, TAG,
+                            "Additional network hook failed: "
+                                    + hooked.toGenericString(),
+                            hookError);
+                }
+            }
+
+            log(Log.INFO, TAG,
+                    "Hook installed: additional Be.d URL methods="
+                            + installed);
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "Additional Be.d diagnostics unavailable", t);
         }
     }
 
