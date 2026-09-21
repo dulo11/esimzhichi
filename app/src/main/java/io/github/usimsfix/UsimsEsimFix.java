@@ -78,9 +78,9 @@ public class UsimsEsimFix extends XposedModule {
         hookUsimsRouteLogin(classLoader);
         hookOkHttpRouteLogin(classLoader);
 
-        log(Log.INFO, TAG, "v1.4.2 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG, "v1.4.3 loaded for " + TARGET_PACKAGE);
         log(Log.INFO, TAG,
-                "MODULE diagnostics=routeLogin+prefs+PlayIntegrityReadOnly process=" + safeProcessName()
+                "MODULE diagnostics=routeLogin+prefs+PlayIntegrityTaskCompletion process=" + safeProcessName()
                         + " pid=" + android.os.Process.myPid()
                         + " uid=" + android.os.Process.myUid()
                         + " classLoader=" + classLoader.getClass().getName());
@@ -393,6 +393,14 @@ public class UsimsEsimFix extends XposedModule {
                                                 ? "null"
                                                 : result.getClass().getName()));
 
+                                if (result != null) {
+                                    attachIntegrityTaskCompletionDiagnostic(
+                                            result,
+                                            hooked.getName(),
+                                            started
+                                    );
+                                }
+
                                 return result;
                             });
 
@@ -409,6 +417,260 @@ public class UsimsEsimFix extends XposedModule {
         } catch (Throwable t) {
             log(Log.WARN, TAG,
                     "Integrity runtime manager diagnostic failed", t);
+        }
+    }
+
+    private void attachIntegrityTaskCompletionDiagnostic(
+            Object task,
+            String label,
+            long startedMs) {
+        try {
+            Method addOnComplete = null;
+            Class<?> listenerType = null;
+
+            for (Method method : task.getClass().getMethods()) {
+                if (!"addOnCompleteListener".equals(method.getName())) {
+                    continue;
+                }
+
+                Class<?>[] p = method.getParameterTypes();
+                if (p.length != 1) {
+                    continue;
+                }
+
+                if (p[0].getName().endsWith(".OnCompleteListener")) {
+                    addOnComplete = method;
+                    listenerType = p[0];
+                    break;
+                }
+            }
+
+            if (addOnComplete == null || listenerType == null) {
+                log(Log.INFO, TAG,
+                        "INTEGRITY_TASK listener-unavailable label="
+                                + label
+                                + " taskClass=" + task.getClass().getName());
+                return;
+            }
+
+            final Class<?> finalListenerType = listenerType;
+
+            Object listener = java.lang.reflect.Proxy.newProxyInstance(
+                    finalListenerType.getClassLoader(),
+                    new Class[]{finalListenerType},
+                    (proxy, method, args) -> {
+                        if ("onComplete".equals(method.getName())
+                                && args != null
+                                && args.length > 0
+                                && args[0] != null) {
+                            logIntegrityTaskState(
+                                    args[0],
+                                    label,
+                                    startedMs
+                            );
+                        }
+
+                        if ("toString".equals(method.getName())) {
+                            return "USIMSeSIMFixIntegrityListener(" + label + ")";
+                        }
+
+                        if ("hashCode".equals(method.getName())) {
+                            return System.identityHashCode(proxy);
+                        }
+
+                        if ("equals".equals(method.getName())) {
+                            return args != null
+                                    && args.length == 1
+                                    && proxy == args[0];
+                        }
+
+                        return null;
+                    }
+            );
+
+            addOnComplete.setAccessible(true);
+            addOnComplete.invoke(task, listener);
+
+            log(Log.INFO, TAG,
+                    "INTEGRITY_TASK listener-attached label="
+                            + label
+                            + " taskClass=" + task.getClass().getName());
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "INTEGRITY_TASK listener attach failed label="
+                            + label
+                            + " type=" + t.getClass().getSimpleName(),
+                    t);
+        }
+    }
+
+    private void logIntegrityTaskState(
+            Object task,
+            String label,
+            long startedMs) {
+        try {
+            long elapsedMs =
+                    android.os.SystemClock.elapsedRealtime() - startedMs;
+
+            boolean complete =
+                    booleanNoArg(task, "isComplete", true);
+            boolean successful =
+                    booleanNoArg(task, "isSuccessful", false);
+            boolean canceled =
+                    booleanNoArg(task, "isCanceled", false);
+
+            Throwable exception = null;
+            try {
+                Object ex = invokeNoArgs(task, "getException");
+                if (ex instanceof Throwable) {
+                    exception = (Throwable) ex;
+                }
+            } catch (Throwable ignored) {
+            }
+
+            log(Log.INFO, TAG,
+                    "INTEGRITY_TASK COMPLETE label=" + label
+                            + " elapsedMs=" + elapsedMs
+                            + " complete=" + complete
+                            + " successful=" + successful
+                            + " canceled=" + canceled
+                            + " exceptionClass="
+                            + (exception == null
+                            ? "null"
+                            : exception.getClass().getName())
+                            + " exceptionMessage="
+                            + (exception == null
+                            ? "null"
+                            : summarizeThrowableMessage(
+                            exception.getMessage()
+                    )));
+
+            if (successful
+                    && "prepareIntegrityToken".equals(label)) {
+                try {
+                    Object provider = invokeNoArgs(task, "getResult");
+
+                    log(Log.INFO, TAG,
+                            "INTEGRITY_PROVIDER obtained class="
+                                    + (provider == null
+                                    ? "null"
+                                    : provider.getClass().getName()));
+
+                    if (provider != null) {
+                        hookIntegrityRuntimeProvider(provider);
+                    }
+                } catch (Throwable t) {
+                    log(Log.WARN, TAG,
+                            "INTEGRITY_PROVIDER inspect failed type="
+                                    + t.getClass().getSimpleName());
+                }
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "INTEGRITY_TASK state diagnostic failed label="
+                            + label,
+                    t);
+        }
+    }
+
+    private boolean booleanNoArg(
+            Object target,
+            String method,
+            boolean fallback) {
+        try {
+            Object value = invokeNoArgs(target, method);
+            return value instanceof Boolean
+                    ? (Boolean) value
+                    : fallback;
+        } catch (Throwable t) {
+            return fallback;
+        }
+    }
+
+    private void hookIntegrityRuntimeProvider(Object provider) {
+        if (provider == null) {
+            return;
+        }
+
+        try {
+            Class<?> cls = provider.getClass();
+
+            for (Method method : cls.getMethods()) {
+                if (!"request".equals(method.getName())) {
+                    continue;
+                }
+
+                String id =
+                        cls.getName() + "#" + method.toGenericString();
+
+                if (!HOOKED_INTEGRITY_METHODS.add(id)) {
+                    continue;
+                }
+
+                method.setAccessible(true);
+                final Method hooked = method;
+
+                try {
+                    hook(hooked)
+                            .setExceptionMode(
+                                    XposedInterface.ExceptionMode.PROTECTIVE
+                            )
+                            .intercept(chain -> {
+                                long started =
+                                        android.os.SystemClock.elapsedRealtime();
+
+                                log(Log.INFO, TAG,
+                                        "INTEGRITY_PROVIDER_CALL BEGIN method="
+                                                + hooked.toGenericString()
+                                                + " argTypes="
+                                                + summarizeArgTypes(
+                                                chain.getArgs()
+                                        ));
+                                logInterestingStack(
+                                        "INTEGRITY_PROVIDER_CALL caller",
+                                        10
+                                );
+
+                                Object result = chain.proceed();
+
+                                long elapsed =
+                                        android.os.SystemClock
+                                                .elapsedRealtime()
+                                                - started;
+
+                                log(Log.INFO, TAG,
+                                        "INTEGRITY_PROVIDER_CALL END method="
+                                                + hooked.getName()
+                                                + " elapsedMs=" + elapsed
+                                                + " returnClass="
+                                                + (result == null
+                                                ? "null"
+                                                : result.getClass().getName()));
+
+                                if (result != null) {
+                                    attachIntegrityTaskCompletionDiagnostic(
+                                            result,
+                                            "standardProvider.request",
+                                            started
+                                    );
+                                }
+
+                                return result;
+                            });
+
+                    log(Log.INFO, TAG,
+                            "Hook installed: integrity provider method="
+                                    + hooked.toGenericString());
+                } catch (Throwable hookError) {
+                    log(Log.WARN, TAG,
+                            "Integrity provider hook failed: "
+                                    + hooked.toGenericString(),
+                            hookError);
+                }
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "Integrity provider diagnostic failed", t);
         }
     }
 
