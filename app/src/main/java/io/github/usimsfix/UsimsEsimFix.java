@@ -67,7 +67,7 @@ public class UsimsEsimFix extends XposedModule {
         hookUsimsRouteLogin(classLoader);
         hookOkHttpRouteLogin(classLoader);
 
-        log(Log.INFO, TAG, "v1.3.2 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG, "v1.3.3 loaded for " + TARGET_PACKAGE);
     }
 
     private void hookUsimsEsimCheck(ClassLoader classLoader) {
@@ -275,33 +275,62 @@ public class UsimsEsimFix extends XposedModule {
             java.util.Collections.sort(keys);
             log(Log.INFO, TAG, "DIRECT responseKeys=" + keys);
 
-            String[] diagnosticKeys = new String[]{
-                    "code",
-                    "status",
-                    "success",
-                    "message",
-                    "msg",
-                    "error",
-                    "error_code",
-                    "errorCode",
-                    "reason"
-            };
+            java.util.Set<String> wanted = new java.util.HashSet<>(
+                    java.util.Arrays.asList(
+                            "code",
+                            "status",
+                            "success",
+                            "message",
+                            "msg",
+                            "error",
+                            "error_code",
+                            "errorcode",
+                            "reason",
+                            "result"
+                    )
+            );
 
             boolean found = false;
-            for (String key : diagnosticKeys) {
-                if (!obj.has(key) || obj.isNull(key)) {
+            for (String actualKey : keys) {
+                String normalized = actualKey == null
+                        ? "" : actualKey.toLowerCase(Locale.ROOT);
+                if (!wanted.contains(normalized) || obj.isNull(actualKey)) {
                     continue;
                 }
+
                 found = true;
-                Object value = obj.opt(key);
+                Object value = obj.opt(actualKey);
+
+                if ("result".equals(normalized)) {
+                    String text = String.valueOf(value);
+                    log(Log.INFO, TAG,
+                            "DIRECT response." + actualKey + "="
+                                    + "<type="
+                                    + (value == null ? "null" : value.getClass().getName())
+                                    + " len=" + text.length()
+                                    + " sha256=" + shortHash(text) + ">");
+
+                    if (value instanceof JSONObject) {
+                        java.util.List<String> nestedKeys = new java.util.ArrayList<>();
+                        java.util.Iterator<String> nested = ((JSONObject) value).keys();
+                        while (nested.hasNext()) {
+                            nestedKeys.add(nested.next());
+                        }
+                        java.util.Collections.sort(nestedKeys);
+                        log(Log.INFO, TAG,
+                                "DIRECT response." + actualKey + "Keys=" + nestedKeys);
+                    }
+                    continue;
+                }
+
                 log(Log.INFO, TAG,
-                        "DIRECT response." + key + "="
-                                + summarizeResponseValue(key, value));
+                        "DIRECT response." + actualKey + "="
+                                + summarizeResponseValue(actualKey, value));
             }
 
             if (!found) {
                 log(Log.INFO, TAG,
-                        "DIRECT response=<JSON parsed; no standard diagnostic fields>");
+                        "DIRECT response=<JSON parsed; no diagnostic fields>");
             }
         } catch (Throwable t) {
             log(Log.WARN, TAG,
