@@ -67,7 +67,7 @@ public class UsimsEsimFix extends XposedModule {
         hookUsimsRouteLogin(classLoader);
         hookOkHttpRouteLogin(classLoader);
 
-        log(Log.INFO, TAG, "v1.3.3 loaded for " + TARGET_PACKAGE);
+        log(Log.INFO, TAG, "v1.3.4 loaded for " + TARGET_PACKAGE);
     }
 
     private void hookUsimsEsimCheck(ClassLoader classLoader) {
@@ -302,24 +302,7 @@ public class UsimsEsimFix extends XposedModule {
                 Object value = obj.opt(actualKey);
 
                 if ("result".equals(normalized)) {
-                    String text = String.valueOf(value);
-                    log(Log.INFO, TAG,
-                            "DIRECT response." + actualKey + "="
-                                    + "<type="
-                                    + (value == null ? "null" : value.getClass().getName())
-                                    + " len=" + text.length()
-                                    + " sha256=" + shortHash(text) + ">");
-
-                    if (value instanceof JSONObject) {
-                        java.util.List<String> nestedKeys = new java.util.ArrayList<>();
-                        java.util.Iterator<String> nested = ((JSONObject) value).keys();
-                        while (nested.hasNext()) {
-                            nestedKeys.add(nested.next());
-                        }
-                        java.util.Collections.sort(nestedKeys);
-                        log(Log.INFO, TAG,
-                                "DIRECT response." + actualKey + "Keys=" + nestedKeys);
-                    }
+                    logResultStructure("DIRECT response." + actualKey, value, 0);
                     continue;
                 }
 
@@ -336,6 +319,115 @@ public class UsimsEsimFix extends XposedModule {
             log(Log.WARN, TAG,
                     "DIRECT response JSON parse failed; len=" + raw.length()
                             + " sha256=" + shortHash(raw));
+        }
+    }
+
+    private void logResultStructure(String label, Object value, int depth) {
+        if (value == null || value == JSONObject.NULL) {
+            log(Log.INFO, TAG, label + "=null");
+            return;
+        }
+
+        if (depth > 2) {
+            String text = String.valueOf(value);
+            log(Log.INFO, TAG,
+                    label + "=<depth-limit type=" + value.getClass().getName()
+                            + " len=" + text.length()
+                            + " sha256=" + shortHash(text) + ">");
+            return;
+        }
+
+        if (value instanceof JSONObject) {
+            JSONObject obj = (JSONObject) value;
+            java.util.List<String> keys = new java.util.ArrayList<>();
+            java.util.Iterator<String> it = obj.keys();
+            while (it.hasNext()) {
+                keys.add(it.next());
+            }
+            java.util.Collections.sort(keys);
+            log(Log.INFO, TAG, label + "Keys=" + keys);
+
+            java.util.Set<String> readable = new java.util.HashSet<>(
+                    java.util.Arrays.asList(
+                            "code",
+                            "status",
+                            "success",
+                            "message",
+                            "msg",
+                            "error",
+                            "error_code",
+                            "errorcode",
+                            "reason",
+                            "compatible",
+                            "compatibility",
+                            "device_compatible",
+                            "devicecompatible",
+                            "supported",
+                            "min_version",
+                            "minversion",
+                            "latest_version",
+                            "latestversion",
+                            "app_version",
+                            "appversion"
+                    )
+            );
+
+            for (String key : keys) {
+                Object nested = obj.opt(key);
+                String normalized = key == null
+                        ? "" : key.toLowerCase(Locale.ROOT);
+
+                if (readable.contains(normalized)) {
+                    log(Log.INFO, TAG,
+                            label + "." + key + "="
+                                    + summarizeResponseValue(key, nested));
+                } else if (nested instanceof JSONObject
+                        || nested instanceof org.json.JSONArray) {
+                    logResultStructure(label + "." + key, nested, depth + 1);
+                }
+            }
+            return;
+        }
+
+        if (value instanceof org.json.JSONArray) {
+            org.json.JSONArray array = (org.json.JSONArray) value;
+            log(Log.INFO, TAG,
+                    label + "=<array length=" + array.length() + ">");
+            int inspect = Math.min(array.length(), 3);
+            for (int i = 0; i < inspect; i++) {
+                Object item = array.opt(i);
+                if (item instanceof JSONObject
+                        || item instanceof org.json.JSONArray) {
+                    logResultStructure(label + "[" + i + "]", item, depth + 1);
+                }
+            }
+            return;
+        }
+
+        if (value instanceof Boolean || value instanceof Number) {
+            log(Log.INFO, TAG, label + "=" + String.valueOf(value));
+            return;
+        }
+
+        String text = String.valueOf(value);
+        String trimmed = text.trim();
+        log(Log.INFO, TAG,
+                label + "=<type=" + value.getClass().getName()
+                        + " len=" + text.length()
+                        + " sha256=" + shortHash(text) + ">");
+
+        if (trimmed.startsWith("{")) {
+            try {
+                logResultStructure(label + ".json",
+                        new JSONObject(trimmed), depth + 1);
+            } catch (Throwable ignored) {
+            }
+        } else if (trimmed.startsWith("[")) {
+            try {
+                logResultStructure(label + ".json",
+                        new org.json.JSONArray(trimmed), depth + 1);
+            } catch (Throwable ignored) {
+            }
         }
     }
 
