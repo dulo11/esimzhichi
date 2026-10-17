@@ -1,0 +1,57 @@
+name: One-time save Actions builds to Releases
+on:
+  push:
+    paths:
+      - '.github/workflows/backup-actions-artifacts-once.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive, verify and clear exact Actions artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: artifact-backup-2026-10-17
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p raw staged verified
+          while IFS='|' read -r artifact_id artifact_name; do
+            metadata="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id")"
+            test "$(printf '%s' "$metadata" | jq -r .name)" = "$artifact_name"
+            test "$(printf '%s' "$metadata" | jq -r .expired)" = false
+            run_id="$(printf '%s' "$metadata" | jq -r .workflow_run.id)"
+            test "$run_id" != null
+            gh run download "$run_id" --name "$artifact_name" --dir "raw/$artifact_name"
+            test -n "$(find "raw/$artifact_name" -type f -print -quit)"
+            while IFS= read -r -d '' file; do
+              base="$(basename "$file")"
+              test ! -e "staged/$base"
+              cp "$file" "staged/$base"
+            done < <(find "raw/$artifact_name" -type f -print0)
+          done <<'ARTIFACTS'
+          10670335191|USIMS-eSIM-Fix-v1.4.4
+          ARTIFACTS
+          test -n "$(find staged -type f -print -quit)"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title 'Retained Actions build backup (2026-10-17)' --notes 'Archive of last retained Actions build artifacts. Originals removed only after byte-for-byte verification. Same repository visibility applies.' --prerelease --latest=false
+          fi
+          gh release upload "$TAG" staged/* --clobber
+          for file in staged/*; do
+            name="$(basename "$file")"
+            gh release download "$TAG" --pattern "$name" --dir verified --clobber
+            cmp -s "$file" "verified/$name" || { echo "Verification FAILED: $name"; exit 1; }
+            echo "Verified backup $name ($(wc -c < "$file") bytes)"
+          done
+          while IFS='|' read -r artifact_id artifact_name; do
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
+            echo "Deleted backed-up artifact $artifact_id $artifact_name"
+          done <<'ARTIFACTS'
+          10670335191|USIMS-eSIM-Fix-v1.4.4
+          ARTIFACTS
+          echo 'Backup completed, moved 1 artifacts'
